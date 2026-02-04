@@ -15,51 +15,13 @@ from rt_utils import RTStructBuilder
 import matplotlib.pyplot as plt
 import time
 
+from src.checks.check_frame_of_reference_UID import check_frame_of_reference_uid
+
 
 def convert_image_to_numpy(image):
     # helper function, extracts a numpy array from an SimpleITK image
     return sitk.GetArrayFromImage(image)
 
-
-def check_frame_of_reference_uid(ct_folder, rtdose_file, rtstruct_file):
-    """
-    Check if CT, RTDOSE, and RTSTRUCT have matching Frame of Reference UID.
-    This is crucial for proper registration.
-    
-    Args:
-        ct_folder: Path to CT DICOM folder
-        rtdose_file: Path to RTDOSE file
-        rtstruct_file: Path to RTSTRUCT file
-        
-    Returns:
-        bool: True if all UIDs match
-    """
-    print("\nChecking Frame of Reference UIDs...")
-    
-    # Get CT UID (from first slice)
-    ct_files = [f for f in os.listdir(ct_folder) if f.endswith('.dcm') or not '.' in f]
-    if ct_files:
-        ct_ds = pydicom.dcmread(os.path.join(ct_folder, ct_files[0]))
-        ct_uid = ct_ds.FrameOfReferenceUID if hasattr(ct_ds, 'FrameOfReferenceUID') else None
-    else:
-        ct_uid = None
-    
-    # Get RTDOSE UID
-    dose_ds = pydicom.dcmread(rtdose_file)
-    dose_uid = dose_ds.FrameOfReferenceUID if hasattr(dose_ds, 'FrameOfReferenceUID') else None
-    
-    # Get RTSTRUCT UID
-    struct_ds = pydicom.dcmread(rtstruct_file)
-    struct_uid = struct_ds.ReferencedFrameOfReferenceSequence[0].FrameOfReferenceUID if hasattr(struct_ds, 'ReferencedFrameOfReferenceSequence') else None
-    
-    print(f"CT Frame of Reference UID: {ct_uid}")
-    print(f"RTDOSE Frame of Reference UID: {dose_uid}")
-    print(f"RTSTRUCT Frame of Reference UID: {struct_uid}")
-    
-    match = (ct_uid == dose_uid == struct_uid)
-    print(f"UIDs match: {match}")
-    
-    return match
 
 
 def read_ct_dicom_series(ct_folder_path):
@@ -182,12 +144,15 @@ def read_rtstruct_with_rtutils(rtstruct_file_path, ct_folder_path):
     print(f"Found {len(structure_names)} structures: {structure_names}")
     
     # Extract masks for each structure
+    t0_1 = time.time()
     masks_dict = {}
     for roi_name in structure_names:
         mask = rtstruct.get_roi_mask_by_name(roi_name)
         masks_dict[roi_name] = mask
         voxel_count = np.sum(mask)
         print(f"  {roi_name}: {voxel_count} voxels")
+    t1_1 = time.time()
+    print("XXX", t1_1 -t0_1)
     
     return masks_dict, structure_names
 
@@ -347,10 +312,7 @@ def get_segmentation_mask(segmentation_map, values):
 
     """
     # Initialize mask
-    mask = np.zeros_like(segmentation_map, dtype=np.uint8)
-    for val in values:
-        mask[segmentation_map == val] = 1
-    return mask
+    return np.isin(segmentation_map, values).astype(np.uint8)
 
 
 def struct_names_to_values(struct_names_list, label_dict):
