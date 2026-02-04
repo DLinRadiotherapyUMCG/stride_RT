@@ -409,12 +409,9 @@ def crop_image(image:sitk.Image, bounding_box_coords: dict, bb_size: list):
     z_lower, z_upper = bounding_box_coords['z']['lower'], bounding_box_coords['z']['upper']
 
     # Define the region of interest
-    print([x_lower, y_lower, z_lower], bb_size, [x_upper, y_upper, z_upper])
-    
-    index = [x_lower, y_lower, z_lower]  # starting index (x, y, z)
-    size = [bb_size[0], bb_size[1], bb_size[2]]
-    index = [int(x) for x in index]
-    size = [int(x) for x in size]
+   
+    index = [int(x_lower), int(y_lower), int(z_lower)]  # starting index (x, y, z)
+    size = [int(bb_size[0]), int(bb_size[1]), int(bb_size[2])] # size of the BB
 
     cropped_image = sitk.RegionOfInterest(image, size=size, index=index)
 
