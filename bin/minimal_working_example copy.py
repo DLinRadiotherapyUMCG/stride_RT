@@ -142,6 +142,15 @@ def read_rtstruct_with_rtutils(rtstruct_file_path, ct_folder_path):
     # Get all structure names
     structure_names = rtstruct.get_roi_names()
     print(f"Found {len(structure_names)} structures: {structure_names}")
+
+    # relevant_structs = ['Crico',
+    #                     'Mandible',
+    #                     'Parotid_L',
+    #                     'Parotid_R',
+    #                     'Submandibular_L',
+    #                     'Submandibular_R',
+    #                     'Thyroid']
+    # structure_names = [x for x in structure_names if x in relevant_structs]
     
     # Extract masks for each structure
     t0_1 = time.time()

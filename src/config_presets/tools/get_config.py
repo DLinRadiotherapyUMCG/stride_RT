@@ -1,0 +1,61 @@
+# -*- coding: utf-8 -*-
+import logging
+import yaml
+import os
+
+from src.config_presets.tools.load_config import load_config
+
+
+def get_config(name, name_base = 'Base_config', pathGiven = ""):
+    """
+    Constructs config as used throughout the main file 
+    """
+    
+    # Load 
+    base_config = load_config(name_base,pathGiven)
+    experiment_config = load_config(name,pathGiven)
+    
+    # Initiate the to be returned config file
+    config = base_config.copy()
+
+    update_config(config, experiment_config)
+
+    # if testMode is active, overwrite the settings used in the testMode_config.yaml file
+    if config['general']['testMode']:
+        testMode_config = load_config('testMode_config', pathGiven)
+        update_config(config, testMode_config, allow_new_keys=True)
+
+    # check the config for errors
+    check_config(config)
+    
+    return config
+
+
+
+
+def check_config(config):
+    """
+    Check label-related settings in the config file.
+    """
+    pass
+
+
+
+
+def update_config(base, updates, allow_new_keys=False):
+    """
+    Recursively updates the base dictionary with values from the updates dictionary.
+    Only non-dictionary values are overwritten. \
+    (i.e. if only one thing in the 'model' key needs to be updated, the rest of the 'model' dict will remain the same)
+    """
+    for key, value in updates.items():
+        if key == 'hyperparam_tuning': #  override option to allow `hyperparam_tuning` key to be added to the config
+            allow_new_keys = True      #  often, this is not in the base config (because then it would need to contain every possible hyperparameter tuning variable)
+        
+        if (key in base) and (isinstance(base[key], dict)) and (isinstance(value, dict)):  # if we are dealing with nested dictionaries
+            update_config(base[key], value, allow_new_keys=allow_new_keys)
+        else:          
+            if (key not in base) and (not allow_new_keys):      # if the new config has entries that do not exist in the base config, raise an error
+                raise KeyError(f"Key '{key}' not found in base dictionary.")
+            else:
+                base[key] = value                              # update the base config with the new value for this entry

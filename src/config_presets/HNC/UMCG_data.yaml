@@ -1,0 +1,74 @@
+
+
+
+directories:
+    sources:
+        data_dir: '//zkh/appdata/RTDicom/PRI2MA/{}'
+        DLC_dir: "None"
+
+
+
+
+# stuff
+patient_id_col: 'PatientID'
+
+
+rtstruct:
+
+    structures_list: ['parotis_li', 'parotis_re', 'submandibularis_li', 'submandibularis_re', 'crico', 'thyroid',
+                    'mandible', 'glotticarea', 'oralcavity_ext', 'supraglottic', 'buccalmucosa_li',
+                    'buccalmucosa_re', 'pcm_inf', 'pcm_med', 'pcm_sup', 'esophagus_cerv'] 
+
+    # Create dictionary for mapping structure names
+    struct_name_corrections: {
+                'Parotid_L': 'parotis_li',
+                'Parotid_R': 'parotis_re',
+                'parotis_li': 'parotis_li',
+                'parotis_re': 'parotis_re',
+                'Submandibular_L': 'submandibularis_li',
+                'Submandibular_R': 'submandibularis_re',
+                'submandibularis_li': 'submandibularis_li',
+                'submandibularis_re': 'submandibularis_re',
+                'Crico': 'crico',
+                'cricopharyngeus': 'crico',
+                'Esophagus_Cerv': 'esophagus_cerv',
+                'Thyroid': 'thyroid',
+                'BuccalMucosa_L': 'buccalmucosa_li',
+                'BuccalMucosa_R': 'buccalmucosa_re',
+                'GlotticArea': 'glotticarea',
+                'Mandible': 'mandible',
+                'OralCavity_Ext': 'oralcavity_ext',
+                'PCM_Inf': 'pcm_inf',
+                'PCM_Med': 'pcm_med',
+                'PCM_Sup': 'pcm_sup',
+                'PMC_Inf': 'pcm_inf',
+                'PMC_Med': 'pcm_med',
+                'PMC_Sup': 'pcm_sup',
+                'Supraglottic': 'supraglottic',
+                'SupraglotticLarynx': 'supraglottic',
+            }
+    
+
+    DLC_name_tag: "DLC_" # strip this from the DLC names
+
+
+preprocessing:
+    spacing_correction:
+        isEnabled: True
+        spacing: [1, 1, 2]  # the spacing to resample to (in mm)
+
+    cropping:
+        isEnabled: True
+        cropping_size: [200, 200, 100]
+        cropping_structs:  # the structs to use to define a center point, in each axis
+            z : ["parotis_li", "parotis_re", "crico", "thyroid", "mandible"]
+            x : ["parotis_li", "parotis_re"]
+            y : ["parotis_li", "parotis_re", "submandibularis_li", "submandibularis_re"]
+
+    clipping:
+        isEnabled: True
+        ct_min: -1000  # the minimum intensity value to clip to
+        ct_max: 3000  # the maximum intensity value to clip to
+
+    label_interpolation_mode: 'nearest'  # the interpolation mode to use for the labels when resampling (e.g. 'nearest', 'linear', etc.)
+    non_label_interpolation_mode: 'trilinear'  # the interpolation mode to use for the non-labels when resampling (e.g. 'nearest', 'linear', etc.)
