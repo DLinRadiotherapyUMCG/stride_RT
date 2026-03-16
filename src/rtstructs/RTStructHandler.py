@@ -17,8 +17,9 @@ class RTStructHandler:
     Keeps data as pydicom datasets until final processing
     """
     
-    def __init__(self, config, CT_series: List[pydicom.Dataset], CT_image: sitk.Image):
+    def __init__(self, config, CT_series: List[pydicom.Dataset], CT_image: sitk.Image, verbose: bool = False):
         self.config = config
+        self.verbose = verbose
 
         # CT
         self.CT_series = CT_series
@@ -57,7 +58,8 @@ class RTStructHandler:
         Returns:
             RTSTRUCT dataset
         """
-        print(f"\nLoading RTSTRUCT from {rtstructs_folder_dir}...")
+        if self.verbose:
+            print(f"Loading RTSTRUCT from {rtstructs_folder_dir}...")
         
         # Find all RTSTRUCT DICOM files in the folder
         rtstructs_list = []
@@ -66,7 +68,8 @@ class RTStructHandler:
                 filepath = os.path.join(root, file)
 
                 #try:
-                print(f"  Checking file: {filepath}...")
+                if self.verbose:
+                    print(f"  Checking file: {filepath}...")
                 ds = pydicom.dcmread(filepath, stop_before_pixels=True)
                 ds = self.preprocess_ROI_names(ds, is_DLC=is_DLC)         # correct the names in the rtstruct, and remove all the extra ROIs that are not in the config file (e.g. those with DLC tags, or other extra ROIs that are not needed for modelling)
 
@@ -114,7 +117,6 @@ class RTStructHandler:
 
         # Build mapping of original to corrected names
         original_to_corrected = {}
-        print(len(rtstruct_dataset.StructureSetROISequence))
         for roi in rtstruct_dataset.StructureSetROISequence:
             original_name = roi.ROIName
             if is_DLC:
@@ -152,8 +154,9 @@ class RTStructHandler:
             else:
                 rois_found.append(roi.ROIName)
 
-        print(f"Removed ROIs: {rois_removed}")
-        print(f"Kept ROIs: {rois_found}")
+        if self.verbose:
+            print(f"Removed ROIs: {rois_removed}")
+            print(f"Kept ROIs: {rois_found}")
         
 
         return rtstruct_dataset
@@ -203,7 +206,8 @@ class RTStructHandler:
             raise ValueError("No RTSTRUCT datasets provided for merging")
         
         
-        print(f"\nMerging {len(rtstruct_builders)} RTSTRUCT datasets...")
+        if self.verbose:
+            print(f"\nMerging {len(rtstruct_builders)} RTSTRUCT datasets...")
         
         priority_order = self.config['rtstruct']['structures_list']
         
@@ -230,7 +234,8 @@ class RTStructHandler:
             best_volume_mm3 = 0
             best_mask = None
             
-            print(f"\n  [{label_id}/{len(priority_order)}] Processing '{structure_name}'...")
+            if self.verbose:
+                print(f"\n  [{label_id}/{len(priority_order)}] Processing '{structure_name}'...")
             
             # Check each RTSTRUCT for this structure
             for idx, rtstruct in enumerate(rtstruct_builders):
@@ -240,7 +245,8 @@ class RTStructHandler:
                     
                     # Check if this structure exists
                     if structure_name not in roi_names:
-                        print(f"    - RTSTRUCT {idx+1}/{len(rtstruct_builders)}: '{structure_name}' not found")
+                        if self.verbose:
+                            print(f"    - RTSTRUCT {idx+1}/{len(rtstruct_builders)}: '{structure_name}' not found")
                         continue
                     
                     # Get the 3D mask
@@ -254,7 +260,8 @@ class RTStructHandler:
                     num_voxels = np.sum(roi_mask > 0)
                     volume_mm3 = num_voxels * voxel_volume_mm3
                     
-                    print(f"    - RTSTRUCT {idx+1}/{len(rtstruct_builders)}: volume = {volume_mm3:.2f} mm³ ({num_voxels} voxels)")
+                    if self.verbose:
+                        print(f"    - RTSTRUCT {idx+1}/{len(rtstruct_builders)}: volume = {volume_mm3:.2f} mm³ ({num_voxels} voxels)")
                     
                     # Keep track of best version
                     if volume_mm3 > best_volume_mm3:
@@ -262,7 +269,8 @@ class RTStructHandler:
                         best_mask = roi_mask
                         
                 except Exception as e:
-                    print(f"    - RTSTRUCT {idx+1}/{len(rtstruct_builders)}: Error: {e}")
+                    if self.verbose:
+                        print(f"    - RTSTRUCT {idx+1}/{len(rtstruct_builders)}: Error: {e}")
                     continue
             
             # Add best mask to segmentation array
@@ -271,20 +279,24 @@ class RTStructHandler:
                 # if there are voxels in the mask which are already non-zero in the segmentation array, print a warning that there is overlap between structures
                 overlap_voxels = np.sum((best_mask > 0) & (segmentation_array > 0))
                 if overlap_voxels > 0:
-                    print(f"      ⚠️ Warning: {overlap_voxels} voxels overlap with previously added structures. This may indicate nested or overlapping contours.")
+                    if self.verbose:
+                        print(f"      ⚠️ Warning: {overlap_voxels} voxels overlap with previously added structures. This may indicate nested or overlapping contours.")
                     # print which structures are overlapping
                     overlapping_labels = np.unique(segmentation_array[(best_mask > 0) & (segmentation_array > 0)])
                     overlapping_structures = [priority_order[label-1] for label in overlapping_labels if label > 0 and label <= len(priority_order)]
-                    print(f"        Overlapping structures: {overlapping_structures}")
+                    if self.verbose:
+                        print(f"        Overlapping structures: {overlapping_structures}")
 
                 # and only do so for voxels which do not already have a structure
                 segmentation_array[(best_mask > 0) & (segmentation_array == 0)] = label_id
                 self.contour_volumes[structure_name] = best_volume_mm3
-                print(f"    ✓ Added to segmentation with label {label_id} (volume: {best_volume_mm3:.2f} mm³)")
+                if self.verbose:
+                    print(f"    ✓ Added to segmentation with label {label_id} (volume: {best_volume_mm3:.2f} mm³)")
 
             else:
                 self.contour_volumes[structure_name] = 0
-                print(f"    ✗ '{structure_name}' not found in any RTSTRUCT")
+                if self.verbose:
+                    print(f"    ✗ '{structure_name}' not found in any RTSTRUCT")
         
         # Summary
         segmentation_array = np.transpose(segmentation_array, (2, 1, 0))
@@ -292,12 +304,13 @@ class RTStructHandler:
         segmentation_array = np.swapaxes(segmentation_array, 1, 2)
 
         num_structures_found = sum(1 for v in self.contour_volumes.values() if v > 0)
-        print(f"\n✓ Merge complete:")
-        print(f"  - Segmentation shape: {segmentation_array.shape}")
-        print(f"  - Structures found: {num_structures_found}/{len(priority_order)}")
-        print(f"  - Unique labels: {np.unique(segmentation_array)}")
-        print(f"  - Background voxels: {np.sum(segmentation_array == 0)}")
-        print(f"  - Structure voxels: {np.sum(segmentation_array > 0)}")
+        if self.verbose:
+            print(f"\n✓ Merge complete:")
+            print(f"  - Segmentation shape: {segmentation_array.shape}")
+            print(f"  - Structures found: {num_structures_found}/{len(priority_order)}")
+            print(f"  - Unique labels: {np.unique(segmentation_array)}")
+            print(f"  - Background voxels: {np.sum(segmentation_array == 0)}")
+            print(f"  - Structure voxels: {np.sum(segmentation_array > 0)}")
         
         return segmentation_array
 
