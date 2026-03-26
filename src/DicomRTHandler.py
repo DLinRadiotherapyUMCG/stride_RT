@@ -2,7 +2,6 @@ import pydicom
 import numpy as np
 import os
 import glob
-import copy
 from typing import List, Dict, Optional, Tuple
 
 from src.rtstructs.RTStructHandler import RTStructHandler
@@ -106,15 +105,16 @@ class DicomRTHandler:
             if self.verbose:
                 print(f"Loading DLC RTSTRUCT from {DLC_folder_dir}...")
 
-            import time
-            t0 = time.time()
-            DLC_rtstruct_handler = RTStructHandler(copy.deepcopy(self.config), CT_series=self.CT_series, CT_image=self.CT_image, verbose=self.verbose)
-            DLC_rtstruct_handler.config['rtstruct']['structures_list'] = [x for x in self.config['rtstruct']['structures_list'] if x not in self.structure_masks_dict.keys()]  # set the structures list to the DL structures list, so that it only loads those structures from the DLC RTSTRUCT
-            print(DLC_rtstruct_handler.config['rtstruct']['structures_list'])
+            # Build a config with only the missing structures for the DLC handler
+            dlc_config = self.config.copy()
+            dlc_config['rtstruct'] = self.config['rtstruct'].copy()
+            dlc_config['rtstruct']['structures_list'] = [
+                x for x in self.config['rtstruct']['structures_list']
+                if x not in self.structure_masks_dict
+            ]
+            DLC_rtstruct_handler = RTStructHandler(dlc_config, CT_series=self.CT_series, CT_image=self.CT_image, verbose=self.verbose)
             DLC_rtstruct_handler.load_rtstructs(DLC_folder_dir, fix_uids=fix_uids, is_DLC=True)
             DLC_structure_masks_dict = DLC_rtstruct_handler.structure_masks_dict
-            t1 = time.time()
-            print(f"Time to load DLC RTSTRUCT: {t1 - t0:.2f} seconds")
             #DLC_rtstruct_array = DLC_rtstruct_handler.rtstruct_array
 
             self.structure_masks_dict = self.merge_DLCs_with_rtrstruct(self.structure_masks_dict, DLC_structure_masks_dict)
@@ -261,7 +261,7 @@ class DicomRTHandler:
             if np.any(write_mask):
                 segmentation_array[write_mask] = label_id
 
-        if True:
+        if self.verbose:
             print(f"  - Segmentation shape: {segmentation_array.shape}")
             print(f"  - Unique labels: {np.unique(segmentation_array)}")
             print(f"  - Background voxels: {np.sum(segmentation_array == 0)}")

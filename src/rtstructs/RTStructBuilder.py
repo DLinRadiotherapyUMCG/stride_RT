@@ -1,7 +1,8 @@
 import warnings
+import numpy as np
 from bisect import bisect_left
 
-from typing import Dict, List
+from typing import List
 from pydicom.dataset import Dataset
 from pydicom.filereader import dcmread
 from pydicom import Sequence
@@ -85,6 +86,9 @@ class RTStructBuilder:
             z_pos = round(float(s.ImagePositionPatient[2]), 1)
             z_to_slice[z_pos] = s
 
+        # Pre-sort Z positions for O(log N) fallback lookup
+        sorted_z = sorted(z_to_slice.keys())
+
         # Fix contour-level references by matching Z-positions
         contours_fixed = 0
         contours_failed = 0
@@ -95,17 +99,22 @@ class RTStructBuilder:
             
             for contour in roi_contour.ContourSequence:
                 try:
-                    # Extract Z-coordinate from contour data
-                    contour_data = np.array(contour.ContourData).reshape(-1, 3)
-                    contour_z = round(float(contour_data[0, 2]), 1)
+                    # Extract Z-coordinate from contour data (first point's Z value)
+                    contour_z = round(float(contour.ContourData[2]), 1)
                     
                     # Find closest matching Z-position in CT series
                     if contour_z in z_to_slice:
-                        print(contour_z, "exact match found in CT series")
                         matched_slice = z_to_slice[contour_z]
                     else:
-                        # Find closest Z if exact match not found
-                        closest_z = min(z_to_slice.keys(), key=lambda z: abs(z - contour_z))
+                        # O(log N) bisect lookup instead of O(N) min()
+                        idx = bisect_left(sorted_z, contour_z)
+                        if idx == 0:
+                            closest_z = sorted_z[0]
+                        elif idx == len(sorted_z):
+                            closest_z = sorted_z[-1]
+                        else:
+                            before, after = sorted_z[idx - 1], sorted_z[idx]
+                            closest_z = before if (contour_z - before) <= (after - contour_z) else after
                         matched_slice = z_to_slice[closest_z]
                         z_diff = abs(closest_z - contour_z)
                         if z_diff > 0.5:  # Warn if difference is significant

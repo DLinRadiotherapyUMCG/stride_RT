@@ -2,14 +2,9 @@ import pydicom
 import numpy as np
 import os
 from typing import List, Dict, Optional, Tuple
-from pathlib import Path
-from scipy.ndimage import map_coordinates
-import time
 
 from src.rtstructs.RTStructBuilder import RTStructBuilder
-from src.utils.dicom_header import get_dicom_metadata
 
-from rt_utils import ds_helper
 from rt_utils.rtstruct import RTStruct
 import SimpleITK as sitk
 
@@ -78,7 +73,6 @@ class RTStructHandler:
 
                 # construct the rtstruct volume
                 RTStructBuilder.validate_rtstruct(ds)
-                print("FIX UIDS", fix_uids)
                 if fix_uids:
                     RTStructBuilder.fix_rtstruct_references(ds, self.CT_series)
                 RTStructBuilder.validate_rtstruct_series_references(ds, self.CT_series, warn_only=True)
@@ -174,25 +168,31 @@ class RTStructHandler:
 
         # Remove ROIs that are not in the structures_to_keep list 
         # (makes the rest of the code faster, because we don't have to process as many ROIs later on)
+        structures_to_keep_set = set(structures_to_keep)
         rois_removed = []
         rois_found = []
-        for roi in rtstruct_dataset.StructureSetROISequence:
-            if roi.ROIName not in structures_to_keep:
-                rois_removed.append(roi.ROIName)
+        roi_numbers_to_remove = set()
 
-                # remove the ROI
-                rtstruct_dataset.StructureSetROISequence.remove(roi)
-                # Also need to remove corresponding entries in ROIContourSequence and RTROIObservationsSequence
-                for rc in rtstruct_dataset.ROIContourSequence:
-                    if rc.ReferencedROINumber == roi.ROINumber:
-                        rtstruct_dataset.ROIContourSequence.remove(rc)
-                        break
-                for obs in rtstruct_dataset.RTROIObservationsSequence:
-                    if obs.ReferencedROINumber == roi.ROINumber:
-                        rtstruct_dataset.RTROIObservationsSequence.remove(obs)
-                        break
+        for roi in list(rtstruct_dataset.StructureSetROISequence):
+            if roi.ROIName not in structures_to_keep_set:
+                rois_removed.append(roi.ROIName)
+                roi_numbers_to_remove.add(roi.ROINumber)
             else:
                 rois_found.append(roi.ROIName)
+
+        if roi_numbers_to_remove:
+            rtstruct_dataset.StructureSetROISequence = [
+                roi for roi in rtstruct_dataset.StructureSetROISequence
+                if roi.ROINumber not in roi_numbers_to_remove
+            ]
+            rtstruct_dataset.ROIContourSequence = [
+                rc for rc in rtstruct_dataset.ROIContourSequence
+                if rc.ReferencedROINumber not in roi_numbers_to_remove
+            ]
+            rtstruct_dataset.RTROIObservationsSequence = [
+                obs for obs in rtstruct_dataset.RTROIObservationsSequence
+                if obs.ReferencedROINumber not in roi_numbers_to_remove
+            ]
 
         if self.verbose:
             print(f"Removed ROIs: {rois_removed}")
@@ -231,84 +231,53 @@ class RTStructHandler:
         if not rtstruct_builders:
             raise ValueError("No RTSTRUCT datasets provided for merging")
         
-        
         if self.verbose:
             print(f"\nMerging {len(rtstruct_builders)} RTSTRUCT datasets...")
         
         structures_list = self.config['rtstruct']['structures_list']
+        structures_set = set(structures_list)
         
-        # Get CT geometry for volume calculations and array shape
+        # Get CT geometry for volume calculations
         ct_geom = self.get_ct_geometry()
         pixel_spacing = ct_geom['spacing'][1:3]  # (y, x) spacing
         slice_thickness = ct_geom['spacing'][0]  # z spacing
         voxel_volume_mm3 = pixel_spacing[0] * pixel_spacing[1] * slice_thickness
-        
-        # Get shape from first RTSTRUCT (all should match the CT)
-        # example_mask = rtstruct_builders[0].get_roi_mask_by_name(
-        #     rtstruct_builders[0].get_roi_names()[0]
-        # )
-        #segmentation_shape = example_mask.shape
 
         # Track selected best mask per structure (before overlap handling)
         structure_masks: Dict[str, np.ndarray] = {}
+        best_volumes: Dict[str, float] = {}
         
         # Dictionary to store volume info
-        self.contour_volumes = {}
+        self.contour_volumes = {s: 0 for s in structures_list}
 
-        
-        # Loop through structure names in priority order
-        for label_id, structure_name in enumerate(structures_list, start=1):
-            best_volume_mm3 = 0
-            best_mask = None
-            
+        # Iterate RTSTRUCTs first: get roi_names once per file, only rasterise needed masks
+        for idx, rtstruct in enumerate(rtstruct_builders):
+            roi_names_set = set(rtstruct.get_roi_names())
+            # Only process structures we care about that exist in this RTSTRUCT
+            structures_in_this = structures_set & roi_names_set
+
             if self.verbose:
-                print(f"\n  [{label_id}/{len(structures_list)}] Processing '{structure_name}'...")
-            
-            # Check each RTSTRUCT for this structure
-            for idx, rtstruct in enumerate(rtstruct_builders):
-                try:
-                    # Get all ROI names in this RTSTRUCT
-                    roi_names = rtstruct.get_roi_names()
-                    
-                    # Check if this structure exists
-                    if structure_name not in roi_names:
-                        if self.verbose:
-                            print(f"    - RTSTRUCT {idx+1}/{len(rtstruct_builders)}: '{structure_name}' not found")
-                        continue
-                    
-                    # Get the 3D mask
-                    roi_mask = rtstruct.get_roi_mask_by_name(structure_name)
-                    print(roi_mask.shape)
+                print(f"\n  RTSTRUCT {idx+1}/{len(rtstruct_builders)}: {len(structures_in_this)} matching ROIs")
 
-                    # # fill holes
-                    # #from scipy.ndimage import binary_fill_holes
-                    # roi_mask = binary_fill_holes(roi_mask).astype(np.uint8)
-                    
-                    # Calculate volume
-                    num_voxels = np.sum(roi_mask > 0)
+            for structure_name in structures_in_this:
+                try:
+                    roi_mask = rtstruct.get_roi_mask_by_name(structure_name)
+                    num_voxels = np.count_nonzero(roi_mask)
                     volume_mm3 = num_voxels * voxel_volume_mm3
                     
                     if self.verbose:
-                        print(f"    - RTSTRUCT {idx+1}/{len(rtstruct_builders)}: volume = {volume_mm3:.2f} mm³ ({num_voxels} voxels)")
+                        print(f"    - '{structure_name}': volume = {volume_mm3:.2f} mm³ ({num_voxels} voxels)")
                     
-                    # Keep track of best version
-                    if volume_mm3 > best_volume_mm3:
-                        best_volume_mm3 = volume_mm3
-                        best_mask = roi_mask
+                    # Keep track of best (largest) version
+                    if volume_mm3 > best_volumes.get(structure_name, 0):
+                        best_volumes[structure_name] = volume_mm3
+                        structure_masks[structure_name] = np.transpose(roi_mask, (2, 0, 1))
+                        self.contour_volumes[structure_name] = volume_mm3
                         
                 except Exception as e:
                     if self.verbose:
-                        print(f"    - RTSTRUCT {idx+1}/{len(rtstruct_builders)}: Error: {e}")
+                        print(f"    - '{structure_name}': Error: {e}")
                     continue
-            
-            # Add best mask to segmentation array
-            if best_mask is not None and best_volume_mm3 > 0:
-                if self.verbose:
-                    print(f"  ✓ Adding '{structure_name}' to segmentation (volume: {best_volume_mm3:.2f} mm³)")
-                structure_masks[structure_name] =  np.transpose(best_mask, (2, 0, 1)) # best_mask > 0
-                self.contour_volumes[structure_name] =  best_volume_mm3
-            else:
-                self.contour_volumes[structure_name] = 0
 
 
         self.structure_masks_dict = structure_masks
@@ -382,7 +351,6 @@ class RTStructHandler:
         segmentation_shape = next(iter(struct_masks_dict.values())).shape  # Get shape from any mask (all should be the same)
 
         segmentation_array = np.zeros(segmentation_shape, dtype=np.uint8)
-        print(segmentation_array.shape)
         occupied = np.zeros(segmentation_shape, dtype=bool)
 
         for label_id, structure_name in enumerate(priority_list, start=1):
