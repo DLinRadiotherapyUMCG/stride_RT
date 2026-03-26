@@ -145,7 +145,7 @@ class DicomRTHandler:
 
 
     
-    def compute_structure_mean_doses_and_volumes(self, dose_units='cGy', volume_units='cm3'):
+    def compute_structure_DVHs(self, dose_units='cGy', volume_units='cm3'):
         # compute the mean dose and volume for each structure in the RTSTRUCT, and store it in a dictionary (self.OAR_metadata) with the structure name as key and a dictionary with mean dose and volume as value
 
 
