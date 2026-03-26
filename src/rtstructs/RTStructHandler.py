@@ -4,10 +4,12 @@ import os
 from typing import List, Dict, Optional, Tuple
 from pathlib import Path
 from scipy.ndimage import map_coordinates
+import time
 
 from src.rtstructs.RTStructBuilder import RTStructBuilder
 from src.utils.dicom_header import get_dicom_metadata
 
+from rt_utils import ds_helper
 from rt_utils.rtstruct import RTStruct
 import SimpleITK as sitk
 
@@ -26,6 +28,7 @@ class RTStructHandler:
         self.CT_image = CT_image
 
         # RTSTRUCT
+        self.rtstruct: Optional[RTStruct] = None
         self.rtstruct_image: Optional[sitk.Image] = None
         self.rtstruct_array: Optional[np.ndarray] = None
 
@@ -46,7 +49,7 @@ class RTStructHandler:
             #'orientation': np.array([float(x) for x in first_ct.ImageOrientationPatient])
         }
     
-    def load_rtstructs(self, rtstructs_folder_dir: str, is_DLC: bool = False, fix_uids: bool = True) -> pydicom.Dataset:
+    def load_rtstructs(self, rtstructs_folder_dir: str, is_DLC: bool = False, fix_uids: bool = False) -> pydicom.Dataset:
         """
         Load RTSTRUCT as pydicom dataset
         
@@ -75,6 +78,9 @@ class RTStructHandler:
 
                 # construct the rtstruct volume
                 RTStructBuilder.validate_rtstruct(ds)
+                print("FIX UIDS", fix_uids)
+                if fix_uids:
+                    RTStructBuilder.fix_rtstruct_references(ds, self.CT_series)
                 RTStructBuilder.validate_rtstruct_series_references(ds, self.CT_series, warn_only=True)
                 
                 rtstruct = RTStruct(self.CT_series, ds)
@@ -92,12 +98,45 @@ class RTStructHandler:
         #     print(f"\nOnly one RTSTRUCT file found, creating segmentation array from it...")
         #     rtstruct_array = self._create_segmentation_from_single_rtstruct(rtstructs_list[0])
 
-        rtstruct_array = self.merge_rtstructs(rtstructs_list)
+        merged_rtstruct = self.merge_rtstructs(rtstructs_list)
 
-        self.rtstruct_array = rtstruct_array
+        self.rtstruct = merged_rtstruct
+        # return merged_rtstruct
 
         # # also re-create the rtstruct_image to store in the handler for later use
         # self.rtstruct_image = self.segmentation_array_to_sitk(rtstruct_array, self.CT_image)
+
+    def save_merged_rtstruct(self, output_path: str) -> str:
+        """
+        Save the merged RTSTRUCT object to disk.
+
+        Args:
+            output_path: Destination .dcm path
+
+        Returns:
+            Path where the RTSTRUCT was written
+        """
+        if self.rtstruct is None:
+            raise ValueError("No merged RTSTRUCT available. Run load_rtstructs() first.")
+
+        output_path = str(output_path)
+        output_dir = os.path.dirname(output_path)
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+
+        if hasattr(self.rtstruct, 'save'):
+            self.rtstruct.save(output_path)
+        elif hasattr(self.rtstruct, 'ds') and hasattr(self.rtstruct.ds, 'save_as'):
+            self.rtstruct.ds.save_as(output_path)
+        elif hasattr(self.rtstruct, 'ds'):
+            pydicom.dcmwrite(output_path, self.rtstruct.ds)
+        else:
+            raise TypeError("Unable to save RTSTRUCT: unsupported RTStruct object interface")
+
+        if self.verbose:
+            print(f"Saved merged RTSTRUCT to: {output_path}")
+
+        return output_path
         
 
 
@@ -112,6 +151,7 @@ class RTStructHandler:
         Returns:
             Preprocessed RTSTRUCT dataset
         """
+
         mapping_dict = self.config['rtstruct']['struct_name_corrections']
         structures_to_keep = self.config['rtstruct']['structures_list']
 
@@ -157,6 +197,7 @@ class RTStructHandler:
         if self.verbose:
             print(f"Removed ROIs: {rois_removed}")
             print(f"Kept ROIs: {rois_found}")
+
         
 
         return rtstruct_dataset
@@ -171,36 +212,21 @@ class RTStructHandler:
 
 
     def merge_rtstructs(
-        self, 
+        self,
         rtstruct_builders: List[RTStructBuilder]
-    ) -> np.ndarray:
+    ) -> RTStruct:
         """
-        Merge multiple RTSTRUCT datasets into a single multi-label segmentation array.
+        Merge multiple RTSTRUCT datasets into a single RTStruct object.
         
         For each ROI in the priority list, keeps the contour with the largest volume
-        across all input RTSTRUCTs. Outputs a 3D numpy array where each voxel contains
-        the label ID (0 = background, 1+ = structure index).
+        across all input RTSTRUCTs. Overlap resolution follows priority order: lower
+        label index claims voxels first.
         
         Args:
             rtstruct_builders: List of RTStructBuilder objects to merge
             
         Returns:
-            segmentation_array: 3D numpy array (z, y, x) with integer labels
-                            Label 0 = background
-                            Label 1 = first structure in priority list
-                            Label 2 = second structure in priority list, etc.
-            
-        Example:
-            # Load multiple RTSTRUCTs
-            ct_path = Path("/path/to/ct/series")
-            rtstruct1 = RTStructBuilder.create_from(str(ct_path), str(rtstruct_path1))
-            rtstruct2 = RTStructBuilder.create_from(str(ct_path), str(rtstruct_path2))
-            
-            # Merge into array
-            seg_array = self.merge_rtstructs([rtstruct1, rtstruct2])
-            
-            # seg_array.shape = (num_slices, height, width)
-            # Values: 0=background, 1=first structure, 2=second structure, etc.
+            merged_rtstruct: RTStruct containing merged contours
         """
         if not rtstruct_builders:
             raise ValueError("No RTSTRUCT datasets provided for merging")
@@ -209,7 +235,7 @@ class RTStructHandler:
         if self.verbose:
             print(f"\nMerging {len(rtstruct_builders)} RTSTRUCT datasets...")
         
-        priority_order = self.config['rtstruct']['structures_list']
+        structures_list = self.config['rtstruct']['structures_list']
         
         # Get CT geometry for volume calculations and array shape
         ct_geom = self.get_ct_geometry()
@@ -218,24 +244,25 @@ class RTStructHandler:
         voxel_volume_mm3 = pixel_spacing[0] * pixel_spacing[1] * slice_thickness
         
         # Get shape from first RTSTRUCT (all should match the CT)
-        example_mask = rtstruct_builders[0].get_roi_mask_by_name(
-            rtstruct_builders[0].get_roi_names()[0]
-        )
-        segmentation_shape = example_mask.shape
-        
-        # Initialize output segmentation array
-        segmentation_array = np.zeros(segmentation_shape, dtype=np.uint8)
+        # example_mask = rtstruct_builders[0].get_roi_mask_by_name(
+        #     rtstruct_builders[0].get_roi_names()[0]
+        # )
+        #segmentation_shape = example_mask.shape
+
+        # Track selected best mask per structure (before overlap handling)
+        structure_masks: Dict[str, np.ndarray] = {}
         
         # Dictionary to store volume info
         self.contour_volumes = {}
+
         
         # Loop through structure names in priority order
-        for label_id, structure_name in enumerate(priority_order, start=1):
+        for label_id, structure_name in enumerate(structures_list, start=1):
             best_volume_mm3 = 0
             best_mask = None
             
             if self.verbose:
-                print(f"\n  [{label_id}/{len(priority_order)}] Processing '{structure_name}'...")
+                print(f"\n  [{label_id}/{len(structures_list)}] Processing '{structure_name}'...")
             
             # Check each RTSTRUCT for this structure
             for idx, rtstruct in enumerate(rtstruct_builders):
@@ -251,6 +278,7 @@ class RTStructHandler:
                     
                     # Get the 3D mask
                     roi_mask = rtstruct.get_roi_mask_by_name(structure_name)
+                    print(roi_mask.shape)
 
                     # # fill holes
                     # #from scipy.ndimage import binary_fill_holes
@@ -275,45 +303,108 @@ class RTStructHandler:
             
             # Add best mask to segmentation array
             if best_mask is not None and best_volume_mm3 > 0:
-                # Assign this label ID to all voxels in the mask
-                # if there are voxels in the mask which are already non-zero in the segmentation array, print a warning that there is overlap between structures
-                overlap_voxels = np.sum((best_mask > 0) & (segmentation_array > 0))
-                if overlap_voxels > 0:
-                    if self.verbose:
-                        print(f"      ⚠️ Warning: {overlap_voxels} voxels overlap with previously added structures. This may indicate nested or overlapping contours.")
-                    # print which structures are overlapping
-                    overlapping_labels = np.unique(segmentation_array[(best_mask > 0) & (segmentation_array > 0)])
-                    overlapping_structures = [priority_order[label-1] for label in overlapping_labels if label > 0 and label <= len(priority_order)]
-                    if self.verbose:
-                        print(f"        Overlapping structures: {overlapping_structures}")
-
-                # and only do so for voxels which do not already have a structure
-                segmentation_array[(best_mask > 0) & (segmentation_array == 0)] = label_id
-                self.contour_volumes[structure_name] = best_volume_mm3
                 if self.verbose:
-                    print(f"    ✓ Added to segmentation with label {label_id} (volume: {best_volume_mm3:.2f} mm³)")
-
+                    print(f"  ✓ Adding '{structure_name}' to segmentation (volume: {best_volume_mm3:.2f} mm³)")
+                structure_masks[structure_name] =  np.transpose(best_mask, (2, 0, 1)) # best_mask > 0
+                self.contour_volumes[structure_name] =  best_volume_mm3
             else:
                 self.contour_volumes[structure_name] = 0
-                if self.verbose:
-                    print(f"    ✗ '{structure_name}' not found in any RTSTRUCT")
-        
-        # Summary
-        segmentation_array = np.transpose(segmentation_array, (2, 1, 0))
-        # rotate 90 degrees to match (x,y,z) orientation
-        segmentation_array = np.swapaxes(segmentation_array, 1, 2)
 
-        num_structures_found = sum(1 for v in self.contour_volumes.values() if v > 0)
+
+        self.structure_masks_dict = structure_masks
+        """
+                
+        # Build merged RTSTRUCT from selected masks (independent path)
+        merged_ds = ds_helper.create_rtstruct_dataset(self.CT_series)
+        merged_rtstruct = RTStruct(self.CT_series, merged_ds)
+        #occupied_mask_rtstruct = np.zeros(segmentation_shape, dtype=bool)
+
+        for structure_name in structures_list:
+            if structure_name in structure_masks:
+                write_mask_rtstruct = structure_masks[structure_name] # & (~occupied_mask_rtstruct)
+            else:
+                write_mask_rtstruct = None
+
+            if write_mask_rtstruct is not None and np.any(write_mask_rtstruct):
+                merged_rtstruct.add_roi(
+                    mask=write_mask_rtstruct,
+                    name=structure_name
+                )
+                # occupied_mask_rtstruct |= write_mask_rtstruct
+
+        """
+
+        # Build segmentation array from selected masks (independent path)
+        # this is for the DL models
+        # self.rtstruct_array = self._selected_masks_to_segmentation_array(selected_masks, segmentation_shape)
+
         if self.verbose:
+            num_structures_found = sum(1 for v in self.contour_volumes.values() if v > 0)
             print(f"\n✓ Merge complete:")
+            print(f"  - Structures found: {num_structures_found}/{len(structures_list)}")
+            print(f"  - ROIs in merged RTSTRUCT: {self.structure_masks_dict.keys()}")
+            print(f"  - Missing ROIs: {[s for s in structures_list if s not in self.structure_masks_dict]}")
+
+        # # Build merged RTSTRUCT from selected masks
+        # merged_ds = ds_helper.create_rtstruct_dataset(self.CT_series)
+        # merged_rtstruct = RTStruct(self.CT_series, merged_ds)
+
+        # for structure_name in structures_list:
+        #     if structure_name in structure_masks:
+        #         write_mask_rtstruct = structure_masks[structure_name]
+        #         if np.any(write_mask_rtstruct):
+        #             merged_rtstruct.add_roi(
+        #                 mask=write_mask_rtstruct,
+        #                 name=structure_name
+        #             )
+
+        # return merged_rtstruct
+
+
+
+    def _selected_masks_to_segmentation_array(
+        self,
+        struct_masks_dict: Dict[str, np.ndarray],
+        #segmentation_shape: Tuple
+    ) -> np.ndarray:
+        """
+        Convert a dict of per-structure boolean masks into a multi-class
+        segmentation array with priority-based overlap resolution.
+
+        Args:
+            struct_masks_dict: Mapping of structure name -> boolean 3-D mask
+            #segmentation_shape: Shape of the output array before axis reordering
+
+        Returns:
+            segmentation_array: 3-D numpy array (z, y, x) with integer labels
+        """
+        priority_list = self.config['rtstruct']['DL_structures_list']
+        segmentation_shape = next(iter(struct_masks_dict.values())).shape  # Get shape from any mask (all should be the same)
+
+        segmentation_array = np.zeros(segmentation_shape, dtype=np.uint8)
+        print(segmentation_array.shape)
+        occupied = np.zeros(segmentation_shape, dtype=bool)
+
+        for label_id, structure_name in enumerate(priority_list, start=1):
+            if structure_name not in struct_masks_dict:
+                continue
+            write_mask = struct_masks_dict[structure_name] & (~occupied)
+            if np.any(write_mask):
+                segmentation_array[write_mask] = label_id
+                occupied |= write_mask
+
+        # Reorder axes to (z, y, x) orientation
+        # segmentation_array = np.transpose(segmentation_array, (2, 1, 0))
+        # segmentation_array = np.swapaxes(segmentation_array, 1, 2)
+        segmentation_array = np.transpose(segmentation_array, (2, 0, 1))
+
+        if self.verbose:
             print(f"  - Segmentation shape: {segmentation_array.shape}")
-            print(f"  - Structures found: {num_structures_found}/{len(priority_order)}")
             print(f"  - Unique labels: {np.unique(segmentation_array)}")
             print(f"  - Background voxels: {np.sum(segmentation_array == 0)}")
             print(f"  - Structure voxels: {np.sum(segmentation_array > 0)}")
-        
-        return segmentation_array
 
+        return segmentation_array
 
 
     def segmentation_array_to_sitk(
@@ -323,7 +414,7 @@ class RTStructHandler:
         dtype: int = sitk.sitkUInt8
     ) -> sitk.Image:
         """
-        Convert multi-label segmentation numpy array to SimpleITK Image.
+        Convert multi-class segmentation numpy array to SimpleITK Image.
         
         Args:
             seg_array: 3D numpy array (z, y, x) with integer labels

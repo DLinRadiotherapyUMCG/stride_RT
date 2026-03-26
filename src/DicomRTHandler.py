@@ -2,13 +2,12 @@ import pydicom
 import numpy as np
 import os
 import glob
+import copy
 from typing import List, Dict, Optional, Tuple
-from pathlib import Path
-from scipy.ndimage import map_coordinates
 
-from src.rtstructs.RTStructBuilder import RTStructBuilder
 from src.rtstructs.RTStructHandler import RTStructHandler
 from src.utils.dicom_header import get_dicom_metadata
+from src.DVH.dvh import compute_dvh_metrics
 
 from rt_utils.rtstruct import RTStruct
 import SimpleITK as sitk
@@ -33,17 +32,12 @@ class DicomRTHandler:
         self.rtdose_image: Optional[sitk.Image] = None
 
         # RTSTRUCT
-        self.rtstruct_image: Optional[sitk.Image] = None
-        self.rtstruct_array: Optional[np.ndarray] = None
+        self.struct_masks_dict: Optional[Dict[str, np.ndarray]] = None
 
         self.OAR_metadata = {}
         self.contour_volumes = {}
         
         
-        # Only create arrays when needed for resampling
-        # self._ct_array_cache: Optional[np.ndarray] = None
-        # self._dose_array_cache: Optional[np.ndarray] = None
-        # self._dose_resampled_to_ct: Optional[np.ndarray] = None
     
     def load_ct_series(self, ct_folder: str) -> List[pydicom.Dataset]:
         """
@@ -104,64 +98,58 @@ class DicomRTHandler:
         
         # load and process all of the RTSTRUCT files in the rtstructs_folder_dir
         rtstruct_handler = RTStructHandler(self.config, CT_series=self.CT_series, CT_image=self.CT_image, verbose=self.verbose)
-        rtstruct_handler.load_rtstructs(rtstructs_folder_dir, is_DLC=False)
-        rtstruct_array = rtstruct_handler.rtstruct_array
-
-        unique, counts = np.unique(rtstruct_array, return_counts=True)
-        #dict(zip(unique, counts))
+        rtstruct_handler.load_rtstructs(rtstructs_folder_dir, fix_uids=fix_uids, is_DLC=False)
+        self.structure_masks_dict = rtstruct_handler.structure_masks_dict
 
         # if DLC_folder_dir is provided, also load the RTSTRUCT files in the DLC folder and merge them with the ones from the rtstructs_folder_dir
         if DLC_folder_dir is not None:
             if self.verbose:
                 print(f"Loading DLC RTSTRUCT from {DLC_folder_dir}...")
-            DLC_rtstruct_handler = RTStructHandler(self.config, CT_series=self.CT_series, CT_image=self.CT_image, verbose=self.verbose)
-            DLC_rtstruct_handler.load_rtstructs(DLC_folder_dir, is_DLC=True)
-            DLC_rtstruct_array = DLC_rtstruct_handler.rtstruct_array
 
-            unique, counts = np.unique(DLC_rtstruct_array, return_counts=True)
-            dict(zip(unique, counts))
+            import time
+            t0 = time.time()
+            DLC_rtstruct_handler = RTStructHandler(copy.deepcopy(self.config), CT_series=self.CT_series, CT_image=self.CT_image, verbose=self.verbose)
+            DLC_rtstruct_handler.config['rtstruct']['structures_list'] = [x for x in self.config['rtstruct']['structures_list'] if x not in self.structure_masks_dict.keys()]  # set the structures list to the DL structures list, so that it only loads those structures from the DLC RTSTRUCT
+            print(DLC_rtstruct_handler.config['rtstruct']['structures_list'])
+            DLC_rtstruct_handler.load_rtstructs(DLC_folder_dir, fix_uids=fix_uids, is_DLC=True)
+            DLC_structure_masks_dict = DLC_rtstruct_handler.structure_masks_dict
+            t1 = time.time()
+            print(f"Time to load DLC RTSTRUCT: {t1 - t0:.2f} seconds")
+            #DLC_rtstruct_array = DLC_rtstruct_handler.rtstruct_array
 
-            rtstruct_array = self.merge_DLCs_with_rtrstruct(rtstruct_array, DLC_rtstruct_array)
-
-
-        unique, counts = np.unique(rtstruct_array, return_counts=True)
-        dict(zip(unique, counts))
-
-        self.rtstruct_array = rtstruct_array
-        self.rtstruct_image = self.segmentation_array_to_sitk(rtstruct_array, self.CT_image)
+            self.structure_masks_dict = self.merge_DLCs_with_rtrstruct(self.structure_masks_dict, DLC_structure_masks_dict)
 
 
 
-    def merge_DLCs_with_rtrstruct(self, rtstruct_array: np.ndarray, DLC_rtstruct_array: np.ndarray) -> np.ndarray:
+
+    def merge_DLCs_with_rtrstruct(self, rtstruct_dict, DLC_rtstruct_dict):
         """
         Merge the RTSTRUCT array with the DLC RTSTRUCT array, giving priority to the non-DLC contours (i.e. if there is a conflict between the two, use the DLC contour)
         If there are unique values in the DLC that are not in the normal RTSTRUCT, add those to the merged array as well (where the normal RTSTRUCT is 0, i.e. background, to not conflict with the normal contours)
 
         """
 
-        # Get unique values in both arrays
-        unique_rtstruct = np.unique(rtstruct_array)  # the struct values present in the normal RTSTRUCT
-        unique_DLC = np.unique(DLC_rtstruct_array)   # the struct values present in the DLC 
+        structures_list = self.config['rtstruct']['structures_list']
 
-        # Create a copy of the original RTSTRUCT array to modify
-        merged_array = rtstruct_array.copy()
+        main_structs = rtstruct_dict.keys()  # struct names already present in the main RTSTRUCT
+        DLC_structs = DLC_rtstruct_dict.keys() # struct names present in the DLC RTSTRUCT 
 
-        # Add any unique values from the DLC that are not in the original RTSTRUCT, but only where the original RTSTRUCT is 0 (background)
-        for value in unique_DLC:
-            if value == 0:
-                continue  # skip background
-            if value not in unique_rtstruct:
-                if self.verbose:
-                    print(f"Adding unique DLC structure with value {value} to merged RTSTRUCT")
-                merged_array[(DLC_rtstruct_array == value) & (rtstruct_array == 0)] = value
 
-        return merged_array
+        # if there any structs missing in main_structs, add them from DLC_structs (but only if they are in the structures_list)
+        for struct in structures_list:
+            if struct not in main_structs and struct in DLC_structs:
+                rtstruct_dict[struct] = DLC_rtstruct_dict[struct]
+                
+        return rtstruct_dict
         
 
 
 
     
-    def compute_structure_mean_doses_and_volumes(self, rtstruct_arr, dose_units='cGy', volume_units='cm3'):
+    def compute_structure_mean_doses_and_volumes(self, dose_units='cGy', volume_units='cm3'):
+        # compute the mean dose and volume for each structure in the RTSTRUCT, and store it in a dictionary (self.OAR_metadata) with the structure name as key and a dictionary with mean dose and volume as value
+
+
         # Voxel volume: spacing from SITK is (x, y, z) in mm
         spacing = self.CT_image.GetSpacing()  # (x, y, z)
         voxel_volume_mm3 = spacing[0] * spacing[1] * spacing[2]
@@ -172,48 +160,117 @@ class DicomRTHandler:
         else:
             raise ValueError(f"Unsupported volume units: {volume_units}")
         
-        arr_dose = self.get_dose_array()
+        rtdose_arr = self.get_dose_array()
 
-        value_to_name_dict = {idx: name for idx, name in enumerate(self.config['rtstruct']['structures_list'], start=1)}
 
-        # value_to_name: dict mapping int value -> structure name
-        # e.g. {1: 'parotid_li', 2: 'parotid_re', ...}
+        
 
-        self.OAR_metadata = {}
+        dvh_stats_dict = compute_dvh_metrics(rtdose_arr, self.structure_masks_dict, 
+                                             voxel_volume_cc=voxel_volume_units, dose_units=dose_units)
+        self.OAR_metadata = dvh_stats_dict
 
-        unique_values = np.unique(rtstruct_arr)
-        unique_values = unique_values[unique_values != 0]  # exclude background
+        # print the mean doses and volumes for each structure
+        if self.verbose:
+            print("\nStructure mean doses and volumes:")
+            for struct_name in self.structure_masks_dict.keys():
+                mean_dose = dvh_stats_dict[f'{struct_name}_Dmean']
+                volume_cc = dvh_stats_dict[f'{struct_name}_volume']
+                print(f"  {struct_name}: mean dose = {mean_dose:.2f} {dose_units}, volume = {volume_cc:.2f} {volume_units}")
 
-        for value in unique_values:
-            name = value_to_name_dict.get(int(value), f"structure_{value}")
-            
-            mask = (rtstruct_arr == value)
-            n_voxels = mask.sum()
-            
-            if n_voxels == 0:
-                continue
-            
-            dose_values  = arr_dose[mask]
 
-            if dose_units == 'cGy':
-                dose_values = dose_values   # convert Gy to cGy
-            elif dose_units == 'Gy':
-                dose_values = dose_values / 100.0  # convert cGy to Gy
-            else:
-                raise ValueError(f"Unsupported dose units: {dose_units}")
+        #transformed_dose_arr = np.transpose(rtdose_arr, (1, 2, 0))
 
-            mean_dose    = dose_values.mean()
-            volume_cm3   = n_voxels * voxel_volume_units
+        #mask = rtstruct.get_roi_mask_by_name(structures_list[0])
 
-            self.OAR_metadata[name] = {
-                f"mean_dose_{dose_units}":   float(mean_dose),
-                f"volume_{volume_units}":  float(volume_cm3),
-                "n_voxels":    int(n_voxels)
-            }
-            if self.verbose:
-                print(f"{name}: mean dose = {mean_dose:.2f}, volume = {volume_cm3:.2f} {volume_units}")
+        # compute mean doses
+        # for name in structures_list:
+        #     if name in structs_present:
+        #         mask = self.structure_masks_dict[name]
+
+        #         n_voxels = mask.sum()
+        #         volume_cm3   = n_voxels * voxel_volume_units
+
+        #         # print(rtdose_arr.shape)
+        #         # print(mask.shape)
+
+        #         #mean_dose = rtdose_arr[mask].mean() 
+
+        #         dose_values = rtdose_arr[mask]
+
+        #         if dose_units == 'cGy':
+        #             dose_values = dose_values   # convert Gy to cGy
+        #         elif dose_units == 'Gy':
+        #             dose_values = dose_values / 100.0  # convert cGy to Gy
+        #         else:
+        #             raise ValueError(f"Unsupported dose units: {dose_units}")
+
+        #         mean_dose = dose_values.mean()
+
+        #         """
+        #         COMPUTE DVH STATS HERE!
+        #         """
+
+        #         # print(mask.shape)
+        #         # print(f"{name}: mean dose = {mean_dose/1000:.2f} Gy")
+        #         self.OAR_metadata[name] = {
+        #             f"mean_dose_{dose_units}":   float(mean_dose),
+        #             f"volume_{volume_units}":  float(volume_cm3),
+        #             "n_voxels":    int(n_voxels)
+        #         }
+        #         if self.verbose:
+        #             print(f"{name}: mean dose = {mean_dose:.2f}, volume = {volume_cm3:.2f} {volume_units}")
+        #     else:
+        #         print(f"{name} is NOT present in the RTSTRUCT")
+
 
         return self.OAR_metadata
+
+
+
+    def make_DL_structures_image(
+            self
+        #config,
+        #struct_masks_dict, #: Dict[str, np.ndarray],
+        #segmentation_shape: Tuple
+    ) -> np.ndarray:
+        """
+        Convert a dict of per-structure boolean masks into a multi-class
+        segmentation array with priority-based overlap resolution.
+
+        Args:
+            struct_masks_dict: Mapping of structure name -> boolean 3-D mask
+            #segmentation_shape: Shape of the output array before axis reordering
+
+        Returns:
+            segmentation_array: 3-D numpy array (z, y, x) with integer labels
+        """
+        structure_masks_dict = self.structure_masks_dict
+
+        priority_list = self.config['rtstruct']['DL_structures_list']
+        segmentation_shape = next(iter(structure_masks_dict.values())).shape  # Get shape from any mask (all should be the same)
+
+        segmentation_array = np.zeros(segmentation_shape, dtype=np.uint8)
+
+        for label_id, structure_name in enumerate(priority_list, start=1):
+
+            if structure_name not in structure_masks_dict:
+                continue
+            # the write mask is the current structure, and where there already isn't a structure assigned (occupied)
+            write_mask = (structure_masks_dict[structure_name] > 0) & (segmentation_array == 0)
+
+            if np.any(write_mask):
+                segmentation_array[write_mask] = label_id
+
+        if True:
+            print(f"  - Segmentation shape: {segmentation_array.shape}")
+            print(f"  - Unique labels: {np.unique(segmentation_array)}")
+            print(f"  - Background voxels: {np.sum(segmentation_array == 0)}")
+            print(f"  - Structure voxels: {np.sum(segmentation_array > 0)}")
+
+
+        segmentation_image = self.segmentation_array_to_sitk(segmentation_array, self.CT_image, dtype=sitk.sitkUInt8)
+
+        return segmentation_image
 
 
 

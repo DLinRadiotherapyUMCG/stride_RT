@@ -17,6 +17,15 @@ rtstruct:
 
     structures_list: ['parotis_li', 'parotis_re', 'submandibularis_li', 'submandibularis_re', 'crico', 'thyroid',
                     'mandible', 'glotticarea', 'oralcavity_ext', 'supraglottic', 'buccalmucosa_li',
+                    'buccalmucosa_re', 'pcm_inf', 'pcm_med', 'pcm_sup', 'esophagus_cerv', 
+                    # also other structs (for which we want DVHs ):
+                    'Parotid_R_Out', 'Parotid_L_Out', 'Submandibular_L_Out', 'Submandibular_R_Out', 
+                    'GlotticArea_Out', 'OralCavity_Ext_Out', 'PCM_Sup_Out', 'PCM_Med_Out', 'PCM_Inf_Out', 
+                    'Supraglottic_Out', 'Crico_Out', 'Esophagus_Cerv_Out', 'Thyroid_Out'
+                    ] 
+
+    DL_structures_list: ['parotis_li', 'parotis_re', 'submandibularis_li', 'submandibularis_re', 'crico', 'thyroid',
+                    'mandible', 'glotticarea', 'oralcavity_ext', 'supraglottic', 'buccalmucosa_li',
                     'buccalmucosa_re', 'pcm_inf', 'pcm_med', 'pcm_sup', 'esophagus_cerv'] 
 
     # Create dictionary for mapping structure names
