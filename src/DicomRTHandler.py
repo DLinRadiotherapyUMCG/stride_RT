@@ -8,7 +8,6 @@ from src.rtstructs.RTStructHandler import RTStructHandler
 from src.utils.dicom_header import get_dicom_metadata
 from src.DVH.dvh import compute_dvh_metrics
 
-from rt_utils.rtstruct import RTStruct
 import SimpleITK as sitk
 
 class DicomRTHandler:

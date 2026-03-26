@@ -72,13 +72,14 @@ class RTStructBuilder:
             raise Exception("Please check that the existing RTStruct is valid")
 
     @staticmethod
-    def fix_rtstruct_references(ds: Dataset, series_data: List[Dataset]):
+    def fix_rtstruct_references(ds: Dataset, series_data: List[Dataset], verbose: bool = False):
         """
         Fix RTSTRUCT contour references to match the provided CT series by Z-position matching.
         This only updates `ReferencedSOPInstanceUID` values and leaves
         `ReferencedSOPClassUID` unchanged.
         """
-        print("Fixing RTSTRUCT references to match CT series...")
+        if verbose:
+            print("Fixing RTSTRUCT references to match CT series...")
         
         # Build Z-position to slice mapping (rounded to 1 decimal for matching)
         z_to_slice = {}
@@ -136,7 +137,8 @@ class RTStructBuilder:
                     contours_failed += 1
                     warnings.warn(f"Failed to fix contour reference: {str(e)}")
         
-        print(f"Fixed {contours_fixed} contour references, {contours_failed} failed")
+        if verbose:
+            print(f"Fixed {contours_fixed} contour references, {contours_failed} failed")
 
 
     @staticmethod

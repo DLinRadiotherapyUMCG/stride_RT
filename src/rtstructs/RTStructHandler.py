@@ -1,11 +1,11 @@
 import pydicom
 import numpy as np
 import os
+import cv2
 from typing import List, Dict, Optional, Tuple
+from collections import defaultdict
 
 from src.rtstructs.RTStructBuilder import RTStructBuilder
-
-from rt_utils.rtstruct import RTStruct
 import SimpleITK as sitk
 
 class RTStructHandler:
@@ -23,7 +23,7 @@ class RTStructHandler:
         self.CT_image = CT_image
 
         # RTSTRUCT
-        self.rtstruct: Optional[RTStruct] = None
+        self.rtstruct_ds: Optional[pydicom.Dataset] = None  # raw pydicom dataset (if needed for saving)
         self.rtstruct_image: Optional[sitk.Image] = None
         self.rtstruct_array: Optional[np.ndarray] = None
 
@@ -60,49 +60,31 @@ class RTStructHandler:
             print(f"Loading RTSTRUCT from {rtstructs_folder_dir}...")
         
         # Find all RTSTRUCT DICOM files in the folder
-        rtstructs_list = []
+        datasets_list = []
         for root, dirs, files in os.walk(rtstructs_folder_dir):
             for file in files:
                 filepath = os.path.join(root, file)
 
-                #try:
                 if self.verbose:
                     print(f"  Checking file: {filepath}...")
                 ds = pydicom.dcmread(filepath, stop_before_pixels=True)
-                ds = self.preprocess_ROI_names(ds, is_DLC=is_DLC)         # correct the names in the rtstruct, and remove all the extra ROIs that are not in the config file (e.g. those with DLC tags, or other extra ROIs that are not needed for modelling)
+                ds = self.preprocess_ROI_names(ds, is_DLC=is_DLC)
 
-                # construct the rtstruct volume
                 RTStructBuilder.validate_rtstruct(ds)
                 if fix_uids:
-                    RTStructBuilder.fix_rtstruct_references(ds, self.CT_series)
+                    RTStructBuilder.fix_rtstruct_references(ds, self.CT_series, verbose=self.verbose)
                 RTStructBuilder.validate_rtstruct_series_references(ds, self.CT_series, warn_only=True)
-                
-                rtstruct = RTStruct(self.CT_series, ds)
 
-                rtstructs_list.append(rtstruct) 
+                datasets_list.append(ds)
         
-        if not rtstructs_list:
+        if not datasets_list:
             raise ValueError(f"No RTSTRUCT DICOM files found in {rtstructs_folder_dir}")
         
-        # Merge the RTSTRUCT files if there are multiple (combining ROIs)
-        # if len (rtstructs_list) > 1:
-        #     print(f"\nMultiple RTSTRUCT files found ({len(rtstructs_list)}), merging into single segmentation array...")
-        #     rtstruct_array = self.merge_rtstructs(rtstructs_list)
-        # else:
-        #     print(f"\nOnly one RTSTRUCT file found, creating segmentation array from it...")
-        #     rtstruct_array = self._create_segmentation_from_single_rtstruct(rtstructs_list[0])
-
-        merged_rtstruct = self.merge_rtstructs(rtstructs_list)
-
-        self.rtstruct = merged_rtstruct
-        # return merged_rtstruct
-
-        # # also re-create the rtstruct_image to store in the handler for later use
-        # self.rtstruct_image = self.segmentation_array_to_sitk(rtstruct_array, self.CT_image)
+        self.merge_rtstructs(datasets_list)
 
     def save_merged_rtstruct(self, output_path: str) -> str:
         """
-        Save the merged RTSTRUCT object to disk.
+        Save the merged RTSTRUCT dataset to disk.
 
         Args:
             output_path: Destination .dcm path
@@ -110,7 +92,7 @@ class RTStructHandler:
         Returns:
             Path where the RTSTRUCT was written
         """
-        if self.rtstruct is None:
+        if self.rtstruct_ds is None:
             raise ValueError("No merged RTSTRUCT available. Run load_rtstructs() first.")
 
         output_path = str(output_path)
@@ -118,14 +100,7 @@ class RTStructHandler:
         if output_dir:
             os.makedirs(output_dir, exist_ok=True)
 
-        if hasattr(self.rtstruct, 'save'):
-            self.rtstruct.save(output_path)
-        elif hasattr(self.rtstruct, 'ds') and hasattr(self.rtstruct.ds, 'save_as'):
-            self.rtstruct.ds.save_as(output_path)
-        elif hasattr(self.rtstruct, 'ds'):
-            pydicom.dcmwrite(output_path, self.rtstruct.ds)
-        else:
-            raise TypeError("Unable to save RTSTRUCT: unsupported RTStruct object interface")
+        pydicom.dcmwrite(output_path, self.rtstruct_ds)
 
         if self.verbose:
             print(f"Saved merged RTSTRUCT to: {output_path}")
@@ -211,123 +186,178 @@ class RTStructHandler:
 
 
 
+    def _build_transform_matrix(self) -> np.ndarray:
+        """
+        Build patient-to-pixel 4x4 transformation matrix from CT series.
+        Computed once and reused for all ROI rasterisation.
+        """
+        series_data = self.CT_series
+        first_slice = series_data[0]
+
+        offset = np.array([float(x) for x in first_slice.ImagePositionPatient])
+        row_spacing, col_spacing = (float(x) for x in first_slice.PixelSpacing)
+
+        orientation = [float(x) for x in first_slice.ImageOrientationPatient]
+        row_dir = np.array(orientation[:3])
+        col_dir = np.array(orientation[3:])
+        slice_dir = np.cross(row_dir, col_dir)
+
+        if len(series_data) > 1:
+            first_pos = np.dot(slice_dir, [float(x) for x in series_data[0].ImagePositionPatient])
+            last_pos  = np.dot(slice_dir, [float(x) for x in series_data[-1].ImagePositionPatient])
+            slice_spacing = (last_pos - first_pos) / (len(series_data) - 1)
+        else:
+            slice_spacing = 1.0
+
+        # Inverse of the pixel-to-patient matrix
+        linear = np.zeros((3, 3), dtype=np.float64)
+        linear[0, :] = row_dir   / row_spacing
+        linear[1, :] = col_dir   / col_spacing
+        linear[2, :] = slice_dir / slice_spacing
+
+        mat = np.eye(4, dtype=np.float64)
+        mat[:3, :3] = linear
+        mat[:3, 3]  = offset.dot(-linear.T)
+        return mat
+
+    def _rasterize_contours(
+        self,
+        ds: pydicom.Dataset,
+        roi_names: List[str],
+        transform: np.ndarray,
+        uid_to_idx: Dict[str, int],
+    ) -> Dict[str, np.ndarray]:
+        """
+        Rasterize RTSTRUCT contours to 3-D boolean masks (pure pydicom + cv2).
+
+        All contours are grouped by (ROI, slice) in a single O(C) pass, then
+        rasterised with cv2.fillPoly — identical algorithm to rt_utils but
+        without per-ROI matrix recomputation or O(N*M) slice matching.
+
+        Returns:
+            dict mapping roi_name -> bool mask of shape (Columns, Rows, num_slices)
+        """
+        num_slices = len(self.CT_series)
+        cols = int(self.CT_series[0].Columns)
+        rows = int(self.CT_series[0].Rows)
+
+        roi_names_set = set(roi_names)
+
+        # Map ROI number -> name (only for structures we want)
+        roi_num_to_name: Dict[int, str] = {}
+        for roi in ds.StructureSetROISequence:
+            if roi.ROIName in roi_names_set:
+                roi_num_to_name[int(roi.ROINumber)] = roi.ROIName
+
+        # Group contours:  roi_name -> { slice_idx -> [contour_data, ...] }
+        contours_by_roi: Dict[str, Dict[int, list]] = defaultdict(lambda: defaultdict(list))
+
+        for roi_contour in ds.ROIContourSequence:
+            roi_num = int(roi_contour.ReferencedROINumber)
+            if roi_num not in roi_num_to_name:
+                continue
+            name = roi_num_to_name[roi_num]
+            if not hasattr(roi_contour, 'ContourSequence'):
+                continue
+
+            for contour in roi_contour.ContourSequence:
+                if not hasattr(contour, 'ContourImageSequence') or not contour.ContourImageSequence:
+                    continue
+                uid = contour.ContourImageSequence[0].ReferencedSOPInstanceUID
+                if uid in uid_to_idx:
+                    contours_by_roi[name][uid_to_idx[uid]].append(contour.ContourData)
+
+        # Rasterize each ROI
+        masks: Dict[str, np.ndarray] = {}
+        for name in roi_names:
+            if name not in contours_by_roi:
+                continue
+
+            mask = np.zeros((cols, rows, num_slices), dtype=bool)
+
+            for slice_idx, contour_list in contours_by_roi[name].items():
+                polygons = []
+                for contour_data in contour_list:
+                    pts = np.array(contour_data, dtype=np.float64).reshape(-1, 3)
+                    aug = np.column_stack((pts, np.ones(len(pts))))
+                    pixel = (aug @ transform.T)[:, :2]
+                    polygons.append(np.around(pixel).astype(np.int32))
+
+                slice_mask = np.zeros((cols, rows), dtype=np.uint8)
+                cv2.fillPoly(img=slice_mask, pts=polygons, color=1)
+                mask[:, :, slice_idx] = slice_mask.astype(bool)
+
+            masks[name] = mask
+
+        return masks
+
     def merge_rtstructs(
         self,
-        rtstruct_builders: List[RTStructBuilder]
-    ) -> RTStruct:
+        rtstruct_datasets: List[pydicom.Dataset],
+    ):
         """
-        Merge multiple RTSTRUCT datasets into a single RTStruct object.
-        
-        For each ROI in the priority list, keeps the contour with the largest volume
-        across all input RTSTRUCTs. Overlap resolution follows priority order: lower
-        label index claims voxels first.
-        
-        Args:
-            rtstruct_builders: List of RTStructBuilder objects to merge
-            
-        Returns:
-            merged_rtstruct: RTStruct containing merged contours
-        """
-        if not rtstruct_builders:
-            raise ValueError("No RTSTRUCT datasets provided for merging")
-        
-        if self.verbose:
-            print(f"\nMerging {len(rtstruct_builders)} RTSTRUCT datasets...")
-        
-        structures_list = self.config['rtstruct']['structures_list']
-        structures_set = set(structures_list)
-        
-        # Get CT geometry for volume calculations
-        ct_geom = self.get_ct_geometry()
-        pixel_spacing = ct_geom['spacing'][1:3]  # (y, x) spacing
-        slice_thickness = ct_geom['spacing'][0]  # z spacing
-        voxel_volume_mm3 = pixel_spacing[0] * pixel_spacing[1] * slice_thickness
+        Merge multiple RTSTRUCT datasets into self.structure_masks_dict.
 
-        # Track selected best mask per structure (before overlap handling)
+        For each ROI in the config structures_list, keeps the contour with the
+        largest volume across all input RTSTRUCTs.
+
+        Uses pure pydicom + cv2 for contour rasterisation (no rt_utils).
+        The patient-to-pixel transformation matrix and the UID-to-index lookup
+        are computed once and reused for every dataset / ROI.
+        """
+        if not rtstruct_datasets:
+            raise ValueError("No RTSTRUCT datasets provided for merging")
+
+        if self.verbose:
+            print(f"\nMerging {len(rtstruct_datasets)} RTSTRUCT datasets...")
+
+        structures_list = self.config['rtstruct']['structures_list']
+        structures_set  = set(structures_list)
+
+        # Geometry (computed once)
+        ct_geom = self.get_ct_geometry()
+        voxel_volume_mm3 = ct_geom['spacing'][0] * ct_geom['spacing'][1] * ct_geom['spacing'][2]
+        transform  = self._build_transform_matrix()
+        uid_to_idx = {s.SOPInstanceUID: i for i, s in enumerate(self.CT_series)}
+
         structure_masks: Dict[str, np.ndarray] = {}
-        best_volumes: Dict[str, float] = {}
-        
-        # Dictionary to store volume info
+        best_volumes:    Dict[str, float]     = {}
         self.contour_volumes = {s: 0 for s in structures_list}
 
-        # Iterate RTSTRUCTs first: get roi_names once per file, only rasterise needed masks
-        for idx, rtstruct in enumerate(rtstruct_builders):
-            roi_names_set = set(rtstruct.get_roi_names())
-            # Only process structures we care about that exist in this RTSTRUCT
-            structures_in_this = structures_set & roi_names_set
+        for idx, ds in enumerate(rtstruct_datasets):
+            ds_roi_names = {roi.ROIName for roi in ds.StructureSetROISequence}
+            needed = list(structures_set & ds_roi_names)
 
             if self.verbose:
-                print(f"\n  RTSTRUCT {idx+1}/{len(rtstruct_builders)}: {len(structures_in_this)} matching ROIs")
+                print(f"\n  RTSTRUCT {idx+1}/{len(rtstruct_datasets)}: {len(needed)} matching ROIs")
 
-            for structure_name in structures_in_this:
-                try:
-                    roi_mask = rtstruct.get_roi_mask_by_name(structure_name)
-                    num_voxels = np.count_nonzero(roi_mask)
-                    volume_mm3 = num_voxels * voxel_volume_mm3
-                    
-                    if self.verbose:
-                        print(f"    - '{structure_name}': volume = {volume_mm3:.2f} mm³ ({num_voxels} voxels)")
-                    
-                    # Keep track of best (largest) version
-                    if volume_mm3 > best_volumes.get(structure_name, 0):
-                        best_volumes[structure_name] = volume_mm3
-                        structure_masks[structure_name] = np.transpose(roi_mask, (2, 0, 1))
-                        self.contour_volumes[structure_name] = volume_mm3
-                        
-                except Exception as e:
-                    if self.verbose:
-                        print(f"    - '{structure_name}': Error: {e}")
-                    continue
+            if not needed:
+                continue
 
+            # Rasterize all needed ROIs from this dataset in one pass
+            masks = self._rasterize_contours(ds, needed, transform, uid_to_idx)
+
+            for name, mask in masks.items():
+                num_voxels  = np.count_nonzero(mask)
+                volume_mm3  = num_voxels * voxel_volume_mm3
+
+                if self.verbose:
+                    print(f"    - '{name}': volume = {volume_mm3:.2f} mm³ ({num_voxels} voxels)")
+
+                if volume_mm3 > best_volumes.get(name, 0):
+                    best_volumes[name] = volume_mm3
+                    structure_masks[name] = np.transpose(mask, (2, 0, 1))
+                    self.contour_volumes[name] = volume_mm3
 
         self.structure_masks_dict = structure_masks
-        """
-                
-        # Build merged RTSTRUCT from selected masks (independent path)
-        merged_ds = ds_helper.create_rtstruct_dataset(self.CT_series)
-        merged_rtstruct = RTStruct(self.CT_series, merged_ds)
-        #occupied_mask_rtstruct = np.zeros(segmentation_shape, dtype=bool)
-
-        for structure_name in structures_list:
-            if structure_name in structure_masks:
-                write_mask_rtstruct = structure_masks[structure_name] # & (~occupied_mask_rtstruct)
-            else:
-                write_mask_rtstruct = None
-
-            if write_mask_rtstruct is not None and np.any(write_mask_rtstruct):
-                merged_rtstruct.add_roi(
-                    mask=write_mask_rtstruct,
-                    name=structure_name
-                )
-                # occupied_mask_rtstruct |= write_mask_rtstruct
-
-        """
-
-        # Build segmentation array from selected masks (independent path)
-        # this is for the DL models
-        # self.rtstruct_array = self._selected_masks_to_segmentation_array(selected_masks, segmentation_shape)
 
         if self.verbose:
-            num_structures_found = sum(1 for v in self.contour_volumes.values() if v > 0)
-            print(f"\n✓ Merge complete:")
-            print(f"  - Structures found: {num_structures_found}/{len(structures_list)}")
-            print(f"  - ROIs in merged RTSTRUCT: {self.structure_masks_dict.keys()}")
-            print(f"  - Missing ROIs: {[s for s in structures_list if s not in self.structure_masks_dict]}")
+            num_found = sum(1 for v in self.contour_volumes.values() if v > 0)
+            print(f"\n  Merge complete:")
+            print(f"  - Structures found: {num_found}/{len(structures_list)}")
+            print(f"  - ROIs: {list(self.structure_masks_dict.keys())}")
+            print(f"  - Missing: {[s for s in structures_list if s not in self.structure_masks_dict]}")
 
-        # # Build merged RTSTRUCT from selected masks
-        # merged_ds = ds_helper.create_rtstruct_dataset(self.CT_series)
-        # merged_rtstruct = RTStruct(self.CT_series, merged_ds)
-
-        # for structure_name in structures_list:
-        #     if structure_name in structure_masks:
-        #         write_mask_rtstruct = structure_masks[structure_name]
-        #         if np.any(write_mask_rtstruct):
-        #             merged_rtstruct.add_roi(
-        #                 mask=write_mask_rtstruct,
-        #                 name=structure_name
-        #             )
-
-        # return merged_rtstruct
 
 
 

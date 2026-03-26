@@ -73,7 +73,7 @@ def compute_dvh_metrics(
         
         # Handle empty structures
         if len(structure_doses) == 0:
-            print(f"Warning: Structure '{structure_name}' has no voxels")
+            # print(f"Warning: Structure '{structure_name}' has no voxels")
 
             for dose_level in dose_points:
                 results_dict[f'{structure_name}_V{dose_level}'] = None
